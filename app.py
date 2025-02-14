@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import requests
 from io import StringIO
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -27,14 +28,65 @@ def compute_tfidf_matrix(texts):
     tfidf_matrix = vectorizer.fit_transform(texts)
     return vectorizer, tfidf_matrix
 
-# -------------------------------
+# ------------------------------------------------------------------------------
+# 腾讯云混合检索 API 封装函数
+# ------------------------------------------------------------------------------
+def tencent_cloud_hybrid_search(query, docs, dense_weight, sparse_weight, vdb_url, vdb_key):
+    """
+    调用腾讯云混合检索接口：
+      - query: 单个查询字符串
+      - docs: 待检索的内容片段列表
+      - dense_weight, sparse_weight: 权重设置
+      - vdb_url, vdb_key: 腾讯云服务的连接参数
+    假设接口请求发送到 {vdb_url}/hybrid_search，并返回以下 JSON 格式：
+      {
+          "dense_scores": [score1, score2, ...],
+          "sparse_scores": [score1, score2, ...],
+          "hybrid_scores": [score1, score2, ...]
+      }
+    """
+    payload = {
+        "query": query,
+        "documents": docs,
+        "dense_weight": dense_weight,
+        "sparse_weight": sparse_weight
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {vdb_key}"
+    }
+    try:
+        response = requests.post(f"{vdb_url}/hybrid_search", json=payload, headers=headers, timeout=10)
+        response.raise_for_status()  # 若返回状态异常则抛出异常
+    except Exception as e:
+        st.error(f"请求腾讯云混合检索服务失败: {e}")
+        return None
+
+    try:
+        data = response.json()
+    except Exception as e:
+        st.error(f"解析返回数据失败: {e}")
+        return None
+    return data
+
+# ------------------------------------------------------------------------------
 # Streamlit 主程序
-# -------------------------------
-st.title("混合检索 Demo")
-st.write("本 demo 演示基于稠密向量（语义检索）和稀疏向量（关键词检索）的混合检索。请导入或输入一批 query 及内容片段，系统将计算各自的匹配分，并支持导出结果表格。")
+# ------------------------------------------------------------------------------
+st.title("腾讯云混合检索 Demo")
+st.write("本 Demo 演示如何直接调用腾讯云向量数据库服务进行混合检索。请配置腾讯云服务参数后，导入或输入查询与内容片段，系统将调用腾讯云接口返回检索得分。")
+
+# ------------------------------------------------------------------------------
+# 侧边栏：腾讯云混合检索配置
+# ------------------------------------------------------------------------------
+st.sidebar.header("腾讯云混合检索配置")
+# 你可以选择将配置写入 Streamlit secrets 中，本示例允许直接在页面上填入
+vdb_url = st.sidebar.text_input("VDB URL", "http://lb-o1jzbc6h-rmkf8txyz0c17dq5.clb.ap-shanghai.tencentclb.com:10000")
+vdb_key = st.sidebar.text_input("VDB KEY", "R4fThwO4VJhgp9m70YvKDprZ8IrIuzBi1b43Gb9i", type="password")
 
 st.markdown("---")
-# 输入方式选择
+# ------------------------------------------------------------------------------
+# 数据输入方式选择
+# ------------------------------------------------------------------------------
 input_mode = st.radio("请选择输入方式：", ("手动输入", "上传 CSV 文件"))
 
 if input_mode == "手动输入":
@@ -47,9 +99,9 @@ else:
     st.subheader("上传 CSV 文件")
     col1, col2 = st.columns(2)
     with col1:
-        query_file = st.file_uploader("上传查询 CSV 文件（至少包含一列名为 'query'）", type=["csv"])
+        query_file = st.file_uploader("上传查询 CSV 文件（必须包含 'query' 列）", type=["csv"])
     with col2:
-        doc_file = st.file_uploader("上传内容 CSV 文件（至少包含一列名为 'segment'）", type=["csv"])
+        doc_file = st.file_uploader("上传内容 CSV 文件（必须包含 'segment' 列）", type=["csv"])
     queries = []
     docs = []
     if query_file is not None:
@@ -60,7 +112,7 @@ else:
             else:
                 queries = queries_df['query'].dropna().astype(str).tolist()
         except Exception as e:
-            st.error(f"读取查询文件出错：{e}")
+            st.error(f"读取查询文件出错: {e}")
     if doc_file is not None:
         try:
             docs_df = pd.read_csv(doc_file)
@@ -69,61 +121,63 @@ else:
             else:
                 docs = docs_df['segment'].dropna().astype(str).tolist()
         except Exception as e:
-            st.error(f"读取内容文件出错：{e}")
+            st.error(f"读取内容文件出错: {e}")
 
 st.markdown("---")
-# 权重设置
+# ------------------------------------------------------------------------------
+# 设置混合检索的权重参数
+# ------------------------------------------------------------------------------
 st.subheader("设置检索权重")
 dense_weight = st.slider("稠密向量权重（语义检索）", 0.0, 1.0, 0.9, 0.05)
 sparse_weight = st.slider("稀疏向量权重（关键词检索）", 0.0, 1.0, 0.1, 0.05)
 
-# 开始处理
+# ------------------------------------------------------------------------------
+# 批量执行混合检索逻辑
+# ------------------------------------------------------------------------------
 if st.button("运行混合检索"):
-
-    if not queries:
-        st.error("请提供至少一个查询！")
+    if not vdb_url or "YOUR CONNECTION URL" in vdb_url:
+        st.error("请在侧边栏配置正确的 VDB URL！")
+    elif not vdb_key or "YOUR CONNECTION KEY" in vdb_key:
+        st.error("请在侧边栏配置正确的 VDB KEY！")
+    elif not queries:
+        st.error("请至少提供一个查询！")
     elif not docs:
-        st.error("请提供至少一个内容片段！")
+        st.error("请至少提供一个内容片段！")
     else:
-        st.info("开始向量化并计算匹配分，请稍候...")
-        # 加载并计算稠密嵌入
-        dense_model = load_dense_model()
-        with st.spinner("计算稠密向量..."):
-            dense_docs = compute_dense_embeddings(dense_model, docs)
-            dense_queries = compute_dense_embeddings(dense_model, queries)
-        dense_similarities = cosine_similarity(dense_queries, dense_docs)
-        
-        # 稀疏向量处理：利用 TF-IDF
-        with st.spinner("计算稀疏向量 (TF-IDF)..."):
-            tfidf_vectorizer, tfidf_docs = compute_tfidf_matrix(docs)
-            tfidf_queries = tfidf_vectorizer.transform(queries)
-            sparse_similarities = cosine_similarity(tfidf_queries, tfidf_docs)
-        
-        # 混合得分
-        hybrid_similarities = dense_weight * dense_similarities + sparse_weight * sparse_similarities
-        
-        # 构造结果表格，每一行为一个 (query, segment) 对应的各项得分
+        st.info("正在调用腾讯云混合检索服务……")
+        # 最终存放所有结果记录
         result_rows = []
-        for i, query in enumerate(queries):
-            for j, doc in enumerate(docs):
+        # 遍历每个查询，调用腾讯云混合检索接口
+        for query in queries:
+            search_result = tencent_cloud_hybrid_search(query, docs, dense_weight, sparse_weight, vdb_url, vdb_key)
+            if search_result is None:
+                st.error(f"查询 '{query}' 检索失败，跳过该查询。")
+                continue
+            # 期待返回结果中包含 'dense_scores', 'sparse_scores', 'hybrid_scores'
+            dense_scores = search_result.get("dense_scores", [None]*len(docs))
+            sparse_scores = search_result.get("sparse_scores", [None]*len(docs))
+            hybrid_scores = search_result.get("hybrid_scores", [None]*len(docs))
+            for i, doc in enumerate(docs):
                 result_rows.append({
                     "query": query,
                     "segment": doc,
-                    "dense_score": dense_similarities[i][j],
-                    "sparse_score": sparse_similarities[i][j],
-                    "hybrid_score": hybrid_similarities[i][j]
+                    "dense_score": dense_scores[i] if i < len(dense_scores) else None,
+                    "sparse_score": sparse_scores[i] if i < len(sparse_scores) else None,
+                    "hybrid_score": hybrid_scores[i] if i < len(hybrid_scores) else None,
                 })
-        result_df = pd.DataFrame(result_rows)
-        
-        st.success("混合检索完成！")
-        st.subheader("检索结果")
-        st.dataframe(result_df)
-        
-        # 下载结果表格
-        csv = result_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="导出结果为 CSV",
-            data=csv,
-            file_name='hybrid_search_results.csv',
-            mime='text/csv'
-        ) 
+        if not result_rows:
+            st.error("未获取到任何结果。")
+        else:
+            result_df = pd.DataFrame(result_rows)
+            st.success("混合检索完成！")
+            st.subheader("检索结果")
+            st.dataframe(result_df)
+            
+            # 提供下载 CSV 结果的按钮
+            csv = result_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="导出结果为 CSV",
+                data=csv,
+                file_name='tencent_hybrid_search_results.csv',
+                mime='text/csv'
+            ) 
