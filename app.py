@@ -1,155 +1,129 @@
-from flask import Flask, request, render_template, send_file, redirect, url_for
-import os
+import streamlit as st
 import pandas as pd
-import uuid
-import tcvectordb
-from tcvdb_text.encoder import BM25Encoder
-from tcvectordb.model.document import Document
-from tcvectordb.model.param.search import HybridSearchParam, AnnSearch, KeywordSearch, WeightedRerank
+import numpy as np
+from io import StringIO
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-app = Flask(__name__)
+# -------------------------------
+# 缓存模型和计算结果，提高重复运行效率
+# -------------------------------
+@st.cache_resource(show_spinner=False)
+def load_dense_model():
+    # 加载 SentenceTransformer 模型（这里使用 all-MiniLM-L6-v2）
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    return model
 
-# 配置上传文件的保存路径和结果导出路径
-UPLOAD_FOLDER = 'uploads'
-RESULTS_FOLDER = 'results'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULTS_FOLDER, exist_ok=True)
+@st.cache_resource(show_spinner=False)
+def compute_dense_embeddings(model, texts):
+    # 计算稠密向量
+    return model.encode(texts, convert_to_numpy=True)
 
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+@st.cache_resource(show_spinner=False)
+def compute_tfidf_matrix(texts):
+    # 使用 TfidfVectorizer 计算文档的 TF-IDF 矩阵
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    return vectorizer, tfidf_matrix
 
-# 初始化向量数据库客户端
-vdb_url = 'http://lb-o1jzbc6h-rmkf8txyz0c17dq5.clb.ap-shanghai.tencentclb.com:10000'      # 替换为你的连接URL
-vdb_key = 'R4fThwO4VJhgp9m70YvKDprZ8IrIuzBi1b43Gb9i'      # 替换为你的连接KEY
+# -------------------------------
+# Streamlit 主程序
+# -------------------------------
+st.title("混合检索 Demo")
+st.write("本 demo 演示基于稠密向量（语义检索）和稀疏向量（关键词检索）的混合检索。请导入或输入一批 query 及内容片段，系统将计算各自的匹配分，并支持导出结果表格。")
 
-client = tcvectordb.RPCVectorDBClient(
-    url=vdb_url,
-    key=vdb_key,
-    username='root',
-    read_consistency=tcvectordb.ReadConsistency.EVENTUAL_CONSISTENCY,
-    timeout=30
-)
+st.markdown("---")
+# 输入方式选择
+input_mode = st.radio("请选择输入方式：", ("手动输入", "上传 CSV 文件"))
 
-db_name = 'web_demo_db'
-collection_name = 'web_demo_collection'
+if input_mode == "手动输入":
+    st.subheader("手动输入")
+    queries_text = st.text_area("请输入查询（每行一个）：", height=150)
+    docs_text = st.text_area("请输入内容片段（每行一个）：", height=150)
+    queries = [line.strip() for line in queries_text.splitlines() if line.strip()]
+    docs = [line.strip() for line in docs_text.splitlines() if line.strip()]
+else:
+    st.subheader("上传 CSV 文件")
+    col1, col2 = st.columns(2)
+    with col1:
+        query_file = st.file_uploader("上传查询 CSV 文件（至少包含一列名为 'query'）", type=["csv"])
+    with col2:
+        doc_file = st.file_uploader("上传内容 CSV 文件（至少包含一列名为 'segment'）", type=["csv"])
+    queries = []
+    docs = []
+    if query_file is not None:
+        try:
+            queries_df = pd.read_csv(query_file)
+            if 'query' not in queries_df.columns:
+                st.error("查询文件中必须包含 'query' 列")
+            else:
+                queries = queries_df['query'].dropna().astype(str).tolist()
+        except Exception as e:
+            st.error(f"读取查询文件出错：{e}")
+    if doc_file is not None:
+        try:
+            docs_df = pd.read_csv(doc_file)
+            if 'segment' not in docs_df.columns:
+                st.error("内容文件中必须包含 'segment' 列")
+            else:
+                docs = docs_df['segment'].dropna().astype(str).tolist()
+        except Exception as e:
+            st.error(f"读取内容文件出错：{e}")
 
-# 初始化BM25 Encoder
-encoder = BM25Encoder.default('zh')
+st.markdown("---")
+# 权重设置
+st.subheader("设置检索权重")
+dense_weight = st.slider("稠密向量权重（语义检索）", 0.0, 1.0, 0.9, 0.05)
+sparse_weight = st.slider("稀疏向量权重（关键词检索）", 0.0, 1.0, 0.1, 0.05)
 
-# 在首次请求前设置数据库和集合
-@app.before_first_request
-def setup_vector_db():
-    try:
-        client.drop_database(db_name)
-    except Exception:
-        pass  # 如果数据库不存在则跳过
+# 开始处理
+if st.button("运行混合检索"):
 
-    db = client.create_database(db_name)
-
-    # 定义集合的索引结构
-    index = tcvectordb.Index()
-    index.add(tcvectordb.FilterIndex('id', tcvectordb.FieldType.String, tcvectordb.IndexType.PRIMARY_KEY))
-    index.add(tcvectordb.VectorIndex(
-        name='vector',
-        dimension=768,
-        index_type=tcvectordb.IndexType.HNSW,
-        metric_type=tcvectordb.MetricType.IP,
-        params=tcvectordb.HNSWParams(m=16, efconstruction=200)
-    ))
-
-    # 创建 Collection
-    db.create_collection(
-        name=collection_name,
-        shard=1,
-        replicas=1,
-        description='Web Demo Collection',
-        index=index
-    )
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    if request.method == 'POST':
-        # 处理上传的查询文件和内容片段文件
-        queries_file = request.files.get('queries')
-        contents_file = request.files.get('contents')
-
-        if not queries_file or not contents_file:
-            return "请上传查询文件和内容片段文件。", 400
-
-        # 保存上传的文件
-        queries_path = os.path.join(app.config['UPLOAD_FOLDER'], queries_file.filename)
-        contents_path = os.path.join(app.config['UPLOAD_FOLDER'], contents_file.filename)
-        queries_file.save(queries_path)
-        contents_file.save(contents_path)
-
-        # 读取CSV文件
-        queries_df = pd.read_csv(queries_path)
-        contents_df = pd.read_csv(contents_path)
-
-        # 向量化查询和内容片段
-        queries_vectors = encoder.encode_texts(queries_df['query'].tolist())
-        contents_vectors = encoder.encode_texts(contents_df['content'].tolist())
-
-        # 准备要插入向量数据库的文档
-        documents = []
-        for idx, row in contents_df.iterrows():
-            doc = {
-                "id": str(uuid.uuid4()),
-                "vector": contents_vectors[idx],
-                "sparse_vector": contents_vectors[idx],
-                "text": row['content']
-            }
-            documents.append(doc)
-
-        # 批量插入内容片段到向量数据库
-        client.upsert(
-            database_name=db_name,
-            collection_name=collection_name,
-            documents=documents
-        )
-
-        # 等待数据索引完成
-        import time
-        time.sleep(5)  # 根据实际情况调整等待时间
-
-        # 进行混合检索
-        results = []
-        for idx, row in queries_df.iterrows():
-            query_vector = queries_vectors[idx]
-            query_sparse_vector = encoder.encode_queries([row['query']])[0]
-
-            hybrid_search_param = HybridSearchParam(
-                ann=[AnnSearch(field_name="vector", data=query_vector)],
-                match=[KeywordSearch(field_name="sparse_vector", data=query_sparse_vector)],
-                rerank=WeightedRerank(field_list=['vector', 'sparse_vector'], weight=[0.9, 0.1]),
-                retrieve_vector=False,
-                limit=10
-            )
-
-            search_results = client.hybrid_search(
-                database_name=db_name,
-                collection_name=collection_name,
-                param=hybrid_search_param
-            )
-
-            for doc in search_results:
-                results.append({
-                    'query': row['query'],
-                    'content': doc['text'],
-                    'score': doc['score']
+    if not queries:
+        st.error("请提供至少一个查询！")
+    elif not docs:
+        st.error("请提供至少一个内容片段！")
+    else:
+        st.info("开始向量化并计算匹配分，请稍候...")
+        # 加载并计算稠密嵌入
+        dense_model = load_dense_model()
+        with st.spinner("计算稠密向量..."):
+            dense_docs = compute_dense_embeddings(dense_model, docs)
+            dense_queries = compute_dense_embeddings(dense_model, queries)
+        dense_similarities = cosine_similarity(dense_queries, dense_docs)
+        
+        # 稀疏向量处理：利用 TF-IDF
+        with st.spinner("计算稀疏向量 (TF-IDF)..."):
+            tfidf_vectorizer, tfidf_docs = compute_tfidf_matrix(docs)
+            tfidf_queries = tfidf_vectorizer.transform(queries)
+            sparse_similarities = cosine_similarity(tfidf_queries, tfidf_docs)
+        
+        # 混合得分
+        hybrid_similarities = dense_weight * dense_similarities + sparse_weight * sparse_similarities
+        
+        # 构造结果表格，每一行为一个 (query, segment) 对应的各项得分
+        result_rows = []
+        for i, query in enumerate(queries):
+            for j, doc in enumerate(docs):
+                result_rows.append({
+                    "query": query,
+                    "segment": doc,
+                    "dense_score": dense_similarities[i][j],
+                    "sparse_score": sparse_similarities[i][j],
+                    "hybrid_score": hybrid_similarities[i][j]
                 })
-
-        # 将结果保存为CSV
-        results_df = pd.DataFrame(results)
-        results_file = os.path.join(RESULTS_FOLDER, f'results_{uuid.uuid4()}.csv')
-        results_df.to_csv(results_file, index=False)
-
-        return redirect(url_for('download_file', filename=os.path.basename(results_file)))
-
-    return render_template('index.html')
-
-@app.route('/download/<filename>')
-def download_file(filename):
-    return send_file(os.path.join(RESULTS_FOLDER, filename), as_attachment=True)
-
-if __name__ == '__main__':
-    app.run(debug=True)
+        result_df = pd.DataFrame(result_rows)
+        
+        st.success("混合检索完成！")
+        st.subheader("检索结果")
+        st.dataframe(result_df)
+        
+        # 下载结果表格
+        csv = result_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="导出结果为 CSV",
+            data=csv,
+            file_name='hybrid_search_results.csv',
+            mime='text/csv'
+        ) 
