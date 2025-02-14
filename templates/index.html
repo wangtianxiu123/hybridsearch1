@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>混合检索Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <h1>混合检索Demo</h1>
+    <form method="post" enctype="multipart/form-data">
+        <label for="queries">上传查询文件 (CSV 格式，列名: query):</label><br>
+        <input type="file" name="queries" accept=".csv" required><br><br>
+        
+        <label for="contents">上传内容片段文件 (CSV 格式，列名: content):</label><br>
+        <input type="file" name="contents" accept=".csv" required><br><br>
+        
+        <input type="submit" value="开始检索">
+    </form>
+</body>
+</html> 
